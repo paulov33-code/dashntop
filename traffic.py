@@ -44,6 +44,7 @@ class ConsumerItem(BaseModel):
     throughput_bps: float
     is_online: bool
 
+
 # =====================================================================
 # HELPER INTERNO
 # =====================================================================
@@ -63,6 +64,8 @@ def call_ntopng(endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[
         raise HTTPException(status_code=500, detail=f"ntopng Error: {json_data.get('rc_str')}")
     except requests.exceptions.RequestException as e:
         raise HTTPException(status_code=503, detail=f"Error de red en módulo tráfico: {str(e)}")
+    
+
 
 # =====================================================================
 # US-003: TRÁFICO DE RED POR HOST INDIVIDUAL
@@ -186,3 +189,6 @@ def get_top_consumers(
         )
 
     return final_ranking
+
+# NOTA DE RUTEO: Como tu cURL fue a '/api/v1/traffic/195.0.5.240/top-applications',
+# este endpoint asume que tu router en main.py está incluido con el prefijo '/api/v1/traffic'.
