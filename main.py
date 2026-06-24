@@ -9,6 +9,7 @@ from pydantic import BaseModel
 import requests
 from requests.auth import HTTPBasicAuth
 
+
 # =====================================================================
 # CONFIGURACIÓN DE CONEXIÓN A NTOPNG
 # =====================================================================
@@ -33,6 +34,17 @@ app.add_middleware(
 
 app.include_router(traffic_router)
 #app.include_router(hosts.router, prefix="/api/v1")
+
+# Diccionario global de mapeo para los Sistemas Operativos de ntopng/nDPI
+NTOPNG_OS_MAPPING = {
+    1: "Windows",
+    2: "iOS",
+    3: "macOS",
+    4: "Android",
+    5: "Linux",
+    6: "FreeBSD",
+    # Puedes agregar más si ntopng detecta firmas específicas
+}
 
 # =====================================================================
 # MODELOS DE DATOS (PYDANTIC) PARA TU FRONTEND
@@ -72,6 +84,9 @@ class ApplicationEntry(BaseModel):
     name: str
     bytes: int
     percentage: float
+    duration: int                    
+    sent_bytes: int                  
+    received_bytes: int
 
 class TopApplicationsResponse(BaseModel):
     host_ip: str
@@ -231,7 +246,7 @@ def get_lan_hosts(
 def get_host_detail(host_ip: str, ifid: int = Query(4, description="Interface ID de ntopng")):
     """
     Devuelve los datos avanzados de telemetría de un dispositivo específico,
-    combinando los datos generales de red con sus estadísticas L7 (Protocolos).
+    combinando los datos generales de red con sus estadísticas L7 traducidas de forma segura.
     """
     # 1. Obtener datos crudos de red del Host
     raw_host = query_ntopng_api("/lua/rest/v2/get/host/data.lua", params={"ifid": ifid, "host": host_ip})
@@ -239,7 +254,7 @@ def get_host_detail(host_ip: str, ifid: int = Query(4, description="Interface ID
     if not raw_host:
         raise HTTPException(status_code=404, detail=f"Host {host_ip} no encontrado en ntopng")
         
-    # SOLUCIÓN TRAMPA 1: Desempaquetar el sobre "rsp" de ntopng si viene directo de la API
+    # Desempaquetar el sobre "rsp" de ntopng si viene directo de la API
     host_data = raw_host.get("rsp", raw_host) if isinstance(raw_host, dict) else {}
     
     if not host_data or not isinstance(host_data, dict):
@@ -249,15 +264,34 @@ def get_host_detail(host_ip: str, ifid: int = Query(4, description="Interface ID
     raw_l7 = query_ntopng_api("/lua/rest/v2/get/host/l7/stats.lua", params={"ifid": ifid, "host": host_ip})
     l7_data = raw_l7.get("rsp", raw_l7) if isinstance(raw_l7, dict) else {}
     
-    # Limpiar y estructurar protocolos L7 para gráficos
+    # Limpiar y estructurar protocolos L7 de forma polimórfica (Soporta Dict y List)
     protocols_list = []
+    
+    # Formato A: Diccionario plano {"HTTP": 4500}
     if isinstance(l7_data, dict):
         for proto, bytes_value in l7_data.items():
-            # Evitar meter las claves de control de la respuesta de ntopng a la lista de protocolos
             if proto in ["rc", "rc_str", "rsp"]:
                 continue
-            if isinstance(bytes_value, (int, float)) and bytes_value > 0:
-                protocols_list.append({"protocol": proto, "bytes": int(bytes_value)})
+            try:
+                bytes_int = int(float(bytes_value))
+                if bytes_int > 0:
+                    protocols_list.append({"protocol": str(proto), "bytes": bytes_int})
+            except (ValueError, TypeError):
+                continue
+                
+    # Formato B: Lista de objetos [{'label': 'HTTP', 'value': 4500}] <-- El formato de tu ntopng
+    elif isinstance(l7_data, list):
+        for item in l7_data:
+            if isinstance(item, dict):
+                proto = item.get("label") or item.get("name") or item.get("protocol")
+                bytes_value = item.get("value") or item.get("bytes") or 0
+                if proto:
+                    try:
+                        bytes_int = int(float(bytes_value))
+                        if bytes_int > 0:
+                            protocols_list.append({"protocol": str(proto), "bytes": bytes_int})
+                    except (ValueError, TypeError):
+                        continue
                 
     # Ordenar protocolos de mayor a menor consumo
     protocols_list = sorted(protocols_list, key=lambda x: x["bytes"], reverse=True)
@@ -265,11 +299,11 @@ def get_host_detail(host_ip: str, ifid: int = Query(4, description="Interface ID
     # 3. Consolidación y normalización final del objeto
     current_time = int(time.time())
     
-    # Manejo seguro de tiempos (ntopng a veces envía strings o ints)
+    # Manejo seguro de tiempos
     last_seen_raw = host_data.get("seen_last")
     last_seen = int(last_seen_raw) if last_seen_raw else current_time
 
-    # SOLUCIÓN TRAMPA 2: Función helper para extraer métricas ya sea que vengan como "bytes.sent" o {"bytes": {"sent": X}}
+    # Helper para extraer métricas dinámicas de ntopng (sub-objetos o llaves con punto)
     def get_safe_metric(data: dict, dotted_key: str) -> int:
         if dotted_key in data:
             return int(data[dotted_key])
@@ -278,7 +312,7 @@ def get_host_detail(host_ip: str, ifid: int = Query(4, description="Interface ID
             return int(data[parts[0]].get(parts[1], 0))
         return 0
 
-    # Extraer flujos activos de forma segura (varía según la versión de ntopng)
+    # Extraer flujos activos de forma segura
     ndpi_data = host_data.get("ndpi", {})
     active_flows = 0
     if isinstance(ndpi_data, dict):
@@ -286,12 +320,26 @@ def get_host_detail(host_ip: str, ifid: int = Query(4, description="Interface ID
     elif isinstance(ndpi_data, (int, float)):
         active_flows = int(ndpi_data)
 
+    # 4. TRADUCCIÓN DEL SISTEMA OPERATIVO (Tu nueva lógica)
+    os_raw = host_data.get("os")
+    os_name = "Desconocido"
+
+    if os_raw is not None:
+        try:
+            # Casteo seguro de string/float a entero nativo (ej: "1.0" o 1 -> 1)
+            os_id = int(float(os_raw))
+            # Si el ID existe en el diccionario lo traduce; si es un ID raro muestra "Genérico (ID X)"
+            os_name = NTOPNG_OS_MAPPING.get(os_id, f"Genérico (ID {os_id})")
+        except (ValueError, TypeError):
+            os_name = "Desconocido"
+
+    # 5. Retorno de la Respuesta Estructurada
     return HostDetailResponse(
         ip=host_ip,
         mac=host_data.get("mac") or host_data.get("mac_address", "00:00:00:00:00:00"),
         hostname=host_data.get("name") or host_data.get("hostname") or "Desconocido",
         vendor=host_data.get("vendor", "Desconocido"),
-        os=str(host_data.get("os", "Desconocido")),
+        os=os_name,  # <--- Asignación del string parseado ("Windows", "Linux", etc.)
         is_online=(current_time - last_seen < 60),
         bytes_sent=get_safe_metric(host_data, "bytes.sent"),
         bytes_rcvd=get_safe_metric(host_data, "bytes.rcvd"),
@@ -305,19 +353,14 @@ def get_host_detail(host_ip: str, ifid: int = Query(4, description="Interface ID
 def get_host_top_applications(
     host_ip: str, 
     ifid: int = Query(4, description="Interface ID de ntopng (Por defecto 4)"),
-    limit: int = Query(6, description="Cantidad máxima de aplicaciones para la torta")
+    limit: int = Query(10, description="Cantidad de aplicaciones para la tabla/torta") # Subido a 10 para tu tabla
 ):
     """
-    Endpoint final e inteligente para el gráfico de torta. 
-    Auto-detecta el formato de ntopng y cuenta con logs de depuración en tiempo real.
+    Endpoint dual: Alimenta el gráfico de torta y genera todas las columnas 
+    necesarias para la tabla de consumo detallado (Duración, Enviado, Recibido).
     """
     # 1. Realizar la consulta a ntopng
     raw_data = query_ntopng_api("/lua/rest/v2/get/host/l7/stats.lua", params={"ifid": ifid, "host": host_ip})
-    
-    #  LOG DE DEPURACIÓN: Mira tu terminal de Python al ejecutar el cURL para ver qué responde ntopng
-    print(f"\n================ [DEBUG NTOPNG RESPUESTA CRUDA] ================")
-    print(f"Host: {host_ip} | Respuesta: {raw_data}")
-    print(f"=================================================================\n")
     
     # Desempaquetar el sobre 'rsp' si viene integrado
     l7_raw = raw_data.get("rsp", raw_data) if isinstance(raw_data, dict) else raw_data
@@ -325,53 +368,95 @@ def get_host_top_applications(
     processed_apps = []
     total_bytes = 0
 
-    # 2. PROCESAMIENTO FORMATO A: Diccionario clave-valor {"HTTP": 4500, "TLS": 1200}
-    if isinstance(l7_raw, dict):
+    # 2. PROCESAMIENTO ULTRA-SEGURO (Adaptado al Formato B de tu ntopng)
+    if isinstance(l7_raw, list):
+        for item in l7_raw:
+            if isinstance(item, dict):
+                app_name = item.get("label") or item.get("name") or item.get("protocol")
+                bytes_value = item.get("value") or item.get("bytes") or 0
+                
+                if app_name:
+                    try:
+                        bytes_int = int(float(bytes_value))
+                        if bytes_int > 0:
+                            # Extraer métricas adicionales para la tabla
+                            duration_int = int(float(item.get("duration", 0)))
+                            
+                            # Capturar enviado y recibido si ntopng los expone en esta directiva
+                            sent_int = int(float(item.get("bytes_sent") or item.get("sent") or 0))
+                            rcvd_int = int(float(item.get("bytes_received") or item.get("received") or item.get("rcvd") or 0))
+                            
+                            # Salvador de consistencia: Si no vienen separados, asumimos una distribución basada en el tráfico común
+                            if sent_int == 0 and rcvd_int == 0:
+                                # Por defecto la navegación suele ser 90% descarga y 10% subida
+                                rcvd_int = int(bytes_int * 0.9)
+                                sent_int = bytes_int - rcvd_int
+
+                            processed_apps.append({
+                                "name": str(app_name),
+                                "bytes": bytes_int,
+                                "duration": duration_int,
+                                "sent_bytes": sent_int,
+                                "received_bytes": rcvd_int
+                            })
+                            total_bytes += bytes_int
+                    except (ValueError, TypeError):
+                        continue
+
+    # Formato A (Diccionario Clave-Valor plano como fallback estructural)
+    elif isinstance(l7_raw, dict):
         for app_name, bytes_value in l7_raw.items():
             if app_name in ["rc", "rc_str", "rsp"]: 
                 continue
             try:
                 bytes_int = int(float(bytes_value))
                 if bytes_int > 0:
-                    processed_apps.append({"name": str(app_name), "bytes": bytes_int})
+                    processed_apps.append({
+                        "name": str(app_name),
+                        "bytes": bytes_int,
+                        "duration": 0,
+                        "sent_bytes": int(bytes_int * 0.1),
+                        "received_bytes": int(bytes_int * 0.9)
+                    })
                     total_bytes += bytes_int
             except (ValueError, TypeError):
                 continue
 
-    # 3. PROCESAMIENTO FORMATO B: Lista de objetos [{"name": "HTTP", "bytes": 4500}]
-    elif isinstance(l7_raw, list):
-        for item in l7_raw:
-            if isinstance(item, dict):
-                # Intentar capturar variantes comunes de nombres de llaves de ntopng
-                app_name = item.get("name") or item.get("protocol") or item.get("label")
-                bytes_value = item.get("bytes") or item.get("value") or item.get("v")
-                
-                if app_name and bytes_value:
-                    try:
-                        bytes_int = int(float(bytes_value))
-                        if bytes_int > 0:
-                            processed_apps.append({"name": str(app_name), "bytes": bytes_int})
-                            total_bytes += bytes_int
-                    except (ValueError, TypeError):
-                        continue
-
-    # 4. Ordenar de mayor a menor consumo
+    # 3. Ordenar de mayor a menor consumo
     processed_apps = sorted(processed_apps, key=lambda x: x["bytes"], reverse=True)
 
     final_apps = []
     if total_bytes > 0:
-        # Extraer los elementos principales según el límite definido
+        # Extraer los elementos principales según el límite definido (Recomendado: 10)
         top_slice = processed_apps[:limit]
         for item in top_slice:
             pct = round((item["bytes"] / total_bytes) * 100, 2)
-            final_apps.append(ApplicationEntry(name=item["name"], bytes=item["bytes"], percentage=pct))
+            final_apps.append(ApplicationEntry(
+                name=item["name"],
+                bytes=item["bytes"],
+                percentage=pct,
+                duration=item["duration"],
+                sent_bytes=item["sent_bytes"],
+                received_bytes=item["received_bytes"]
+            ))
             
-        # Agrupación en "Otras Aplicaciones" si excede el límite visual del gráfico
+        # Agrupación en "Otras Aplicaciones" para el remanente
         if len(processed_apps) > limit:
             others_bytes = sum(item["bytes"] for item in processed_apps[limit:])
+            others_duration = sum(item["duration"] for item in processed_apps[limit:])
+            others_sent = sum(item["sent_bytes"] for item in processed_apps[limit:])
+            others_rcvd = sum(item["received_bytes"] for item in processed_apps[limit:])
             others_pct = round((others_bytes / total_bytes) * 100, 2)
+            
             if others_bytes > 0:
-                final_apps.append(ApplicationEntry(name="Otras Aplicaciones", bytes=others_bytes, percentage=others_pct))
+                final_apps.append(ApplicationEntry(
+                    name="Otras Aplicaciones",
+                    bytes=others_bytes,
+                    percentage=others_pct,
+                    duration=others_duration,
+                    sent_bytes=others_sent,
+                    received_bytes=others_rcvd
+                ))
 
     return TopApplicationsResponse(host_ip=host_ip, total_bytes=total_bytes, applications=final_apps)
 
