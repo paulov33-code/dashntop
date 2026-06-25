@@ -8,7 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
 from requests.auth import HTTPBasicAuth
-
+from elasticsearch import Elasticsearch
+import os
 
 # =====================================================================
 # CONFIGURACIÓN DE CONEXIÓN A NTOPNG
@@ -34,6 +35,10 @@ app.add_middleware(
 
 app.include_router(traffic_router)
 #app.include_router(hosts.router, prefix="/api/v1")
+
+# coneccion a elastic
+
+es = Elasticsearch(["http://195.0.4.100:9200"])
 
 # Diccionario global de mapeo para los Sistemas Operativos de ntopng/nDPI
 NTOPNG_OS_MAPPING = {
@@ -459,6 +464,163 @@ def get_host_top_applications(
                 ))
 
     return TopApplicationsResponse(host_ip=host_ip, total_bytes=total_bytes, applications=final_apps)
+
+# =====================================================================
+# US-004 : DETALLE DE DOMINIOS VISITADOS DESDE ZEEK
+# =====================================================================
+
+
+@app.get("/api/dns-stats")
+def get_dns_stats(ip: str = Query("195.0.5.240", description="IP de origen a auditar")):
+    # Estructura de la query que definimos para limpiar el ruido
+    query_body = {
+        "size": 0,
+        "query": {
+            "bool": {
+                "must": [
+                    {
+                        "term": {
+                            "source.ip": ip
+                        }
+                    },
+                    {
+                        "regexp": {
+                            "dns.question.name": {
+                                "value": r".+\.(com|net|org|edu|gov|io|co|info|biz|live|office|windows|microsoft|whatsapp)(\..+)*",
+                                "flags": "ALL",
+                                "case_insensitive": True
+                            }
+                        }
+                    }
+                ],
+                "must_not": [
+                    {
+                        "wildcard": {
+                            "dns.question.name": "*.in-addr.arpa"
+                        }
+                    },
+                    {
+                        "wildcard": {
+                            "dns.question.name": "*.local"
+                        }
+                    }
+                ]
+            }
+        },
+        "aggs": {
+            "dominios_puros": {
+                "terms": {
+                    "field": "dns.question.name",
+                    "size": 20
+                }
+            }
+        }
+    }
+
+    try:
+        # Ejecutamos la búsqueda en tus índices de red (ej: "filebeat-*")
+        response = es.search(index="filebeat-*", body=query_body)
+        
+        # Extraemos únicamente los buckets resultantes (Filosofía de Endpoint limpio)
+        buckets = response["aggregations"]["dominios_puros"]["buckets"]
+        
+        # Formateamos la respuesta final
+        return {
+            "success": True,
+            "ip_auditada": ip,
+            "data": [
+                {"dominio": b["key"], "conexiones": b["doc_count"]} 
+                for b in buckets
+            ]
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Error al consultar Elasticsearch: {str(e)}"
+        }
+
+# =====================================================================
+# US-005 : TOP DOMINIOS VISITADOS 
+# =====================================================================
+
+@app.get("/api/top-receptores")
+def get_top_receptores(time_range: str = Query("now-1h", description="Rango de tiempo (ej. now-1h, now-24h)")):
+    # Definimos el cuerpo de la consulta estructurado para Python
+    query_body = {
+        "size": 0,
+        "query": {
+            "bool": {
+                "must": [
+                    {
+                        "range": {
+                            "@timestamp": {
+                                "gte": time_range,
+                                "lte": "now"
+                            }
+                        }
+                    },
+                    {
+                        "term": {
+                            "destination.ip": "195.0.0.0/16"
+                        }
+                    }
+                ]
+            }
+        },
+        "aggs": {
+            "top_receptores_internos": {
+                "terms": {
+                    "field": "destination.ip",
+                    "size": 10,
+                    "order": {
+                        "bytes_recibidos": "desc"
+                    }
+                },
+                "aggs": {
+                    "bytes_recibidos": {
+                        "sum": {
+                            "field": "destination.bytes"
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    try:
+        # Ejecutamos la búsqueda en tus índices (compatible con Elasticsearch v8)
+        response = es.search(index="filebeat-*", body=query_body)
+        
+        # Extraemos los buckets de la agregación
+        buckets = response["aggregations"]["top_receptores_internos"]["buckets"]
+        
+        # Procesamos y formateamos los resultados
+        resultado_limpio = []
+        for b in buckets:
+            bytes_puros = b["bytes_recibidos"]["value"]
+            # Conversión matemática limpia a Megabytes (MB)
+            megabytes = round(bytes_puros / (1024 * 1024), 2)
+            
+            resultado_limpio.append({
+                "ip_destino": b["key"],
+                "conexiones_totales": b["doc_count"],
+                "bytes_recibidos": bytes_puros,
+                "megabytes_recibidos": megabytes
+            })
+            
+        return {
+            "success": True,
+            "rango_evaluado": time_range,
+            "segmento_filtrado": "195.0.0.0/16",
+            "data": resultado_limpio
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Error al consultar los receptores en Elasticsearch: {str(e)}"
+        }
 
 # =====================================================================
 # EJECUCIÓN LOCAL
